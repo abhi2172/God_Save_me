@@ -1,0 +1,281 @@
+//start of Global configuration
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+		// https://mvnrepository.com/artifact/cn.guoyukun.jdbc/oracle-ojdbc6
+		classpath group: 'cn.guoyukun.jdbc', name: 'oracle-ojdbc6', version: '11.2.0.3.0'
+
+	}
+}
+
+
+
+
+plugins {
+  id 'org.hidetake.ssh' version '2.2.0'
+  id 'org.liquibase.gradle' version '1.2.1'
+}
+
+ssh.settings {
+  dryRun = project.hasProperty('dryRun')
+  knownHosts = allowAnyHosts
+}
+//end of Global configuration
+
+//start of different tasks
+
+
+//configures the liquibase Task
+task liquibaseTask << {
+	description = 'configures the liquibase Task'	
+	project.logger.quiet("*************************************Task : liquibaseTask*******************************************")
+	project.logger.quiet("releaseName :: {}  databasebUrl :: {} user :: {} password :: {}",releaseName,databasebUrl,config.database.user,config.database.password)
+	liquibase {
+	  activities {
+	    main {
+	      changeLogFile 'Release1/Database_Components/master.xml'
+	      url databasebUrl
+	      username config.database.user
+	      password config.database.password
+	    }
+	  }
+	  runList = 'main'
+	}
+}
+if(!hasProperty('env') || getProperty('env').toString().isEmpty()) throw new InvalidUserDataException("env was null, Please provide the Environment parameter while running the task")
+
+if(!hasProperty('releaseName') || getProperty('releaseName').toString().isEmpty()) throw new InvalidUserDataException("releaseName was null, Please provide the releaseName parameter while running the task")
+
+//no change is needed for this task
+
+//loadConfiguration is needed to load the configuration details from the config file "Release1/Database_Components/PDHConfig.groovy"
+
+task loadConfiguration << {
+	description = 'Loads the configurations for the server'	
+	
+	project.logger.quiet("*************************************Task : loadConfiguration*******************************************")
+	
+	def environment = project.hasProperty('env') ? project.getProperty('env') : 'DEV1'
+	logger.quiet "Loading configuration for environment {}",environment
+	
+	
+	def release = project.getProperty('releaseName')
+	logger.quiet "Loading configuration for releaseName {}",release
+	
+
+	def configFile = file("Release1/Database_Components/PDHConfig.groovy")
+	def parsedConfig = new ConfigSlurper(env).parse(configFile.toURL())
+	
+	allprojects {
+		ext{
+			config = parsedConfig
+			env = environment
+			databasebUrl = 'jdbc:oracle:thin:@'+config.database.host+':'+config.database.port+'/'+config.database.service
+			releaseName = release
+			fmbDirectory = 	config.LOCAL_FMB_DIRECTORY.replaceAll("releaseName",releaseName)
+		}
+	}
+	logger.quiet "Loading configuration for databasebUrl {}",databasebUrl
+	project.logger.quiet("***configuration loaded :: {} ",config)
+	
+}
+
+//no change is needed for this task
+
+// Create  the remote temporary  folder, if it doesn't exists
+task createTempReleaseFolder << {
+	project.logger.quiet("*************************************Task : createTempReleaseFolder*******************************************")
+	project.logger.quiet("*** Create  the remote temporary  folder, if it doesn't exists ")
+	ssh.run {
+    	session(config.server) {
+    		project.logger.quiet("*** createTempReleaseFolder started for : {}",config.server.host)
+      		execute([ 'cd ' +config.REMOTE_FORM_DIRECTORY  ,
+			'echo `pwd`' ,
+			'[ ! -d ./release/  ] && mkdir ./release' ,
+			'cd ./release/' ,
+			'chmod 777 .' ,
+			'echo "temporary  folder got created"' ].join(' ; '), pty: true)
+      		project.logger.quiet("*** createTempReleaseFolder finished for : {}",config.server.host)
+    	}
+  	}
+}
+
+// Copy the local FMB Files to the remote folder
+task fmbFileCopy << {
+	project.logger.quiet("*************************************Task : fmbFileCopy*******************************************")
+	project.logger.quiet("***FMB Files are about to be copied ")
+	def fmbDirectory = 	config.LOCAL_FMB_DIRECTORY.replaceAll("releaseName",releaseName)
+	project.logger.quiet("***fmb Files Directory :: {} ",fmbDirectory) 
+	ssh.run {
+    	session(config.server) {
+    		project.logger.quiet("*** fmbFileCopy started for : {} from the fmb Directory : {}",config.server.host,fmbDirectory)
+      		put from: fmbDirectory+'/*.fmb', into: config.REMOTE_FORM_DIRECTORY+'/release'
+      		project.logger.quiet("*** fmbFileCopy finished for : {}",config.server.host)
+    	}
+  	}
+}
+
+/*
+Server Name will be passed as 'env', which will be used to load the server parameters
+Release Name will be passed as 'releaseName', which will be used to load the Fmb files from the correct folder
+*/
+task formTask << {
+	project.logger.quiet("*************************************Task : formTask*******************************************") 
+	project.logger.quiet("***server Name passed :: {},  release Name passed :: {} ",env, releaseName) 
+	
+	project.logger.quiet("***fmb Files Directory :: {} ",fmbDirectory) 
+	
+	project.logger.quiet("***Extract the file names to generate the fmx Files ")
+	FileTree tree = fileTree(dir: fmbDirectory)
+	tree.include '**/*.fmb'
+	
+	tree.each {File file ->
+  		def fmbFileName = file.name
+  		def fmxFileName = fmbFileName.replaceAll(".fmb",".fmx")
+  		
+   		project.logger.quiet("***FMX Files are about to be generated for the FMB file : {} to the FMX file : {}", fmbFileName,fmxFileName)
+  		fmxGeneration(fmbFileName, fmxFileName)
+	}
+}
+
+
+
+// Comile & generate the Fmx files for the newly uploaded FMB Files
+def fmxGeneration(def fmbFileName, def fmxFileName) {
+	project.logger.quiet("*************************************fmxGeneration*******************************************")
+	ssh.run {
+	
+	def fmxCommand = config.FMX_COMMAND.replaceAll("FMB_FILE_NAME",fmbFileName).replaceAll("FMX_FILE_NAME",fmxFileName)
+	
+	project.logger.quiet("*** fmxGeneration request fmxCommand: {}", fmxCommand)
+    session(config.server) {
+    	project.logger.quiet("*** fmxGeneration started for : {}",config.server.host)
+		execute([ 'PATH=/bin:/usr/bin:/usr/ucb:/etc:/usr/local/bin:/usr/ccs/bin', 
+		'export PATH', 'ulimit -s unlimited' , 
+		'ulimit -n 65536' ,
+		'umask 022' ,
+		'export ORACLE_SID='+env ,
+		'export ORACLE_HOME='+config.ORACLE_HOME_PATH ,
+		'export TNS_ADMIN='+config.TNS_ADMIN ,
+		'export PATH=$PATH:'+config.CONFIG_PATH ,
+		'. '+config.ENVIRONMENT_PATH ,
+		'FORMS60_PATH=$FORMS60_PATH:$AU_TOP/forms/US:$MHEAU_TOP/forms/US' ,
+		'export FORMS60_PATH' ,
+		'cd '+config.REMOTE_FORM_DIRECTORY+'/release' ,
+		'echo `pwd`' ,
+		fmxCommand ,
+		'echo "compilation done"' ].join(' ; '), pty: true)
+		project.logger.quiet("*** fmxGeneration finished for : {}",config.server.host)
+    }
+  }
+}
+
+
+// Remove the remote FMB Files from the remote temp  folder
+task fmbFileRemove << {
+	project.logger.quiet("*************************************Task : fmbFileRemove*******************************************")
+	project.logger.quiet("*** Remove the remote FMB Files from the remote temp  folder ")
+	ssh.run {
+    	session(config.server) {
+    		project.logger.quiet("*** fmbFileRemove started for : {}",config.server.host)
+      		execute([ 'cd '+config.REMOTE_FORM_DIRECTORY ,
+			'echo `pwd`' ,
+			'rm release/*.fmb' ,
+			'echo "fmb files got removed"' ].join(' ; '), pty: true)
+      		project.logger.quiet("*** fmbFileRemove finished for : {}",config.server.host)
+    	}
+  	}
+}
+
+
+// Run the informatica workflow scripts 
+task informaticaJob << {
+    project.logger.quiet("*************************************Task : informaticaJob *******************************************")
+	    project.logger.quiet('server information '+config.informaticaServer)
+     ssh.run {
+        session(config.informaticaServer) {
+               execute(['echo `pwd`',
+			  'cd /env202/inform/Informatica/PowerCenter9.6.1/server/infa_shared/MHE_DEMANTRA_DEVA/Scripts',
+			  'echo `pwd`' ,
+			  '. setup.sh',
+			  './mhe_siop_run_all_infa_job.ksh MHE_SIOP_INTERFACE_LOAD W_EDW_To_DM_CUSTOMER_INTERFACE_LOAD',
+            'echo "Informatica Workflow invoke"' ].join(' ; '), pty: true)
+                     }
+      }
+}
+
+
+/*The Single task will be responsible to run all the task required for the DB Form Execution
+run Command : gradlew compileDbForm -Penv=DEV1 -PreleaseName=2016-05
+
+Order of the tasks are defined over here
+1. loadConfiguration
+2. createTempReleaseFolder
+3. fmbFileCopy
+4. formTask
+5. fmbFileRemove
+
+*/
+task compileDbForm(dependsOn:['createTempReleaseFolder','loadConfiguration','fmbFileCopy','formTask','fmbFileRemove']){
+	description 'Single task responsible to run all the task required for the DB Form Execution'
+	//println"in task compileForm"
+}
+
+/*The Single task will be responsible to run all the task required for the DB Package Execution
+run Command : gradlew compileDbPackage -Penv=DEV1 -PreleaseName=2016-05
+
+Order of the tasks are defined over here
+1. loadConfiguration
+2. liquibaseTask
+3. update
+*/
+task compileDbPackage(dependsOn:['liquibaseTask','update','loadConfiguration']){
+	description 'Single task responsible to run all the task required for the DB Package Execution'
+	//println"in task compilePackage"
+}
+
+
+task compileInformaticaPackage(dependsOn:['informaticaJob','loadConfiguration']){
+	description 'Running Informatica jobs to invoke workflow scripts'
+	//println"in task compileInformaticaPackage"
+	}
+
+
+
+
+task wrapper(type: Wrapper) {
+    gradleVersion = '2.13'
+}
+
+/* Order of the compileDbForm task are defined over here
+1. loadConfiguration
+2. createTempReleaseFolder
+3. fmbFileCopy
+4. formTask
+5. fmbFileRemove
+*/
+
+createTempReleaseFolder.mustRunAfter loadConfiguration
+
+fmbFileCopy.mustRunAfter createTempReleaseFolder
+
+formTask.mustRunAfter fmbFileCopy
+
+fmbFileRemove.mustRunAfter formTask
+
+
+
+/* Order of the compileDbPackage task are defined over here
+1. loadConfiguration
+2. liquibaseTask
+3. update
+*/
+liquibaseTask.mustRunAfter loadConfiguration
+
+update.mustRunAfter liquibaseTask
+
+
+informaticaJob.mustRunAfter loadConfiguration
